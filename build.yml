@@ -1,0 +1,261 @@
+name: build-bodycam
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tulis source
+        run: |
+          mkdir -p jni
+          cat > jni/bodycam.cpp <<'EOF'
+          // libbodycam.so - perekam mic (OpenSL ES) -> WAV 16kHz mono, untuk MonetLoader (FFI)
+          #include <SLES/OpenSLES.h>
+          #include <SLES/OpenSLES_Android.h>
+          #include <android/log.h>
+          #include <sys/stat.h>
+          #include <atomic>
+          #include <condition_variable>
+          #include <cstdint>
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+          #include <deque>
+          #include <mutex>
+          #include <string>
+          #include <thread>
+          #include <vector>
+
+          #define TAG "bodycam"
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+          #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+          #define API extern "C" __attribute__((visibility("default")))
+
+          namespace {
+          constexpr int kRate = 16000;
+          constexpr int kBufSamples = 1600;  // 100 ms
+          constexpr int kNumBuf = 4;
+          constexpr int kBufBytes = kBufSamples * 2;
+
+          SLObjectItf g_engObj = nullptr, g_recObj = nullptr;
+          SLEngineItf g_eng = nullptr;
+          SLRecordItf g_rec = nullptr;
+          SLAndroidSimpleBufferQueueItf g_bq = nullptr;
+
+          int16_t g_buf[kNumBuf][kBufSamples];
+          int g_cur = 0;
+
+          std::atomic<bool> g_recording{false};
+          std::atomic<int> g_level{0}, g_maxPeak{0};
+          std::atomic<uint32_t> g_dataBytes{0};
+          std::atomic<float> g_gain{1.0f};
+
+          std::mutex g_qmtx, g_ctl;
+          std::condition_variable g_cv;
+          std::deque<std::vector<int16_t>> g_queue;
+          std::thread g_thread;
+          bool g_stopWriter = false;
+          FILE* g_fp = nullptr;
+          std::string g_path;
+
+          void put16(uint8_t* p, uint16_t v) { p[0] = v & 255; p[1] = v >> 8; }
+          void put32(uint8_t* p, uint32_t v) { put16(p, v & 0xFFFF); put16(p + 2, v >> 16); }
+
+          void writeHeader(FILE* f, uint32_t data) {
+            uint8_t h[44];
+            memcpy(h, "RIFF", 4);  put32(h + 4, 36 + data);
+            memcpy(h + 8, "WAVEfmt ", 8); put32(h + 16, 16);
+            put16(h + 20, 1); put16(h + 22, 1);
+            put32(h + 24, kRate); put32(h + 28, kRate * 2);
+            put16(h + 32, 2); put16(h + 34, 16);
+            memcpy(h + 36, "data", 4); put32(h + 40, data);
+            fseek(f, 0, SEEK_SET);
+            fwrite(h, 1, 44, f);
+          }
+
+          void mkdirs(const std::string& file) {
+            size_t last = file.find_last_of('/');
+            if (last == std::string::npos) return;
+            std::string dir = file.substr(0, last);
+            for (size_t i = 1; i <= dir.size(); i++) {
+              if (i == dir.size() || dir[i] == '/') mkdir(dir.substr(0, i).c_str(), 0775);
+            }
+          }
+
+          void bqCallback(SLAndroidSimpleBufferQueueItf q, void*) {
+            if (!g_recording.load()) return;
+            int idx = g_cur;
+            const int16_t* s = g_buf[idx];
+            int peak = 0;
+            for (int i = 0; i < kBufSamples; i++) {
+              int a = s[i] < 0 ? -s[i] : s[i];
+              if (a > peak) peak = a;
+            }
+            g_level = peak * 100 / 32768;
+            if (peak > g_maxPeak.load()) g_maxPeak = peak;
+            {
+              std::lock_guard<std::mutex> lk(g_qmtx);
+              g_queue.emplace_back(s, s + kBufSamples);
+            }
+            g_cv.notify_one();
+            (*q)->Enqueue(q, g_buf[idx], kBufBytes);
+            g_cur = (idx + 1) % kNumBuf;
+          }
+
+          void writerLoop() {
+            int counter = 0;
+            for (;;) {
+              std::vector<int16_t> chunk;
+              {
+                std::unique_lock<std::mutex> lk(g_qmtx);
+                g_cv.wait(lk, [] { return g_stopWriter || !g_queue.empty(); });
+                if (g_queue.empty()) {
+                  if (g_stopWriter) break;
+                  continue;
+                }
+                chunk = std::move(g_queue.front());
+                g_queue.pop_front();
+              }
+              float gain = g_gain.load();
+              if (gain != 1.0f) {
+                for (auto& v : chunk) {
+                  int x = (int)(v * gain);
+                  if (x > 32767) x = 32767;
+                  if (x < -32768) x = -32768;
+                  v = (int16_t)x;
+                }
+              }
+              fwrite(chunk.data(), 2, chunk.size(), g_fp);
+              g_dataBytes += (uint32_t)(chunk.size() * 2);
+              if (++counter % 50 == 0) {  // tiap ~5 dtk: header diperbarui agar file aman jika crash
+                fflush(g_fp);
+                long pos = ftell(g_fp);
+                writeHeader(g_fp, g_dataBytes.load());
+                fseek(g_fp, pos, SEEK_SET);
+              }
+            }
+          }
+
+          void destroyRecorder() {
+            if (g_rec) (*g_rec)->SetRecordState(g_rec, SL_RECORDSTATE_STOPPED);
+            if (g_bq) (*g_bq)->Clear(g_bq);
+            if (g_recObj) { (*g_recObj)->Destroy(g_recObj); g_recObj = nullptr; }
+            if (g_engObj) { (*g_engObj)->Destroy(g_engObj); g_engObj = nullptr; }
+            g_rec = nullptr; g_bq = nullptr; g_eng = nullptr;
+          }
+
+          int failStart(int code) {
+            g_recording = false;
+            destroyRecorder();
+            if (g_fp) { fclose(g_fp); g_fp = nullptr; remove(g_path.c_str()); }
+            return code;
+          }
+          }  // namespace
+
+          // Kode balik: 0 ok, -1 sudah merekam, -2 file gagal dibuat, -3 engine gagal,
+          // -4 recorder gagal dibuat, -5 realize gagal, -6 izin mic ditolak, -7 interface gagal, -8 start gagal
+          API int bodycam_start(const char* path) {
+            std::lock_guard<std::mutex> ctl(g_ctl);
+            if (g_recording.load()) return -1;
+            if (!path || !*path) return -2;
+            g_path = path;
+            mkdirs(g_path);
+            g_fp = fopen(path, "wb");
+            if (!g_fp) { LOGE("fopen gagal: %s", path); return -2; }
+            writeHeader(g_fp, 0);
+
+            g_dataBytes = 0; g_maxPeak = 0; g_level = 0; g_cur = 0;
+            { std::lock_guard<std::mutex> lk(g_qmtx); g_queue.clear(); g_stopWriter = false; }
+
+            if (slCreateEngine(&g_engObj, 0, nullptr, 0, nullptr, nullptr) != SL_RESULT_SUCCESS) return failStart(-3);
+            if ((*g_engObj)->Realize(g_engObj, SL_BOOLEAN_FALSE) != SL_RESULT_SUCCESS) return failStart(-3);
+            if ((*g_engObj)->GetInterface(g_engObj, SL_IID_ENGINE, &g_eng) != SL_RESULT_SUCCESS) return failStart(-3);
+
+            SLDataLocator_IODevice locDev = {SL_DATALOCATOR_IODEVICE, SL_IODEVICE_AUDIOINPUT,
+                                             SL_DEFAULTDEVICEID_AUDIOINPUT, nullptr};
+            SLDataSource src = {&locDev, nullptr};
+            SLDataLocator_AndroidSimpleBufferQueue locBq = {SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE, kNumBuf};
+            SLDataFormat_PCM fmt = {SL_DATAFORMAT_PCM, 1, SL_SAMPLINGRATE_16, SL_PCMSAMPLEFORMAT_FIXED_16,
+                                    SL_PCMSAMPLEFORMAT_FIXED_16, SL_SPEAKER_FRONT_CENTER, SL_BYTEORDER_LITTLEENDIAN};
+            SLDataSink snk = {&locBq, &fmt};
+            const SLInterfaceID ids[2] = {SL_IID_ANDROIDSIMPLEBUFFERQUEUE, SL_IID_ANDROIDCONFIGURATION};
+            const SLboolean req[2] = {SL_BOOLEAN_TRUE, SL_BOOLEAN_FALSE};
+
+            if ((*g_eng)->CreateAudioRecorder(g_eng, &g_recObj, &src, &snk, 2, ids, req) != SL_RESULT_SUCCESS)
+              return failStart(-4);
+
+            SLAndroidConfigurationItf cfg;
+            if ((*g_recObj)->GetInterface(g_recObj, SL_IID_ANDROIDCONFIGURATION, &cfg) == SL_RESULT_SUCCESS) {
+              SLuint32 preset = SL_ANDROID_RECORDING_PRESET_CAMCORDER;
+              (*cfg)->SetConfiguration(cfg, SL_ANDROID_KEY_RECORDING_PRESET, &preset, sizeof(preset));
+            }
+
+            SLresult rr = (*g_recObj)->Realize(g_recObj, SL_BOOLEAN_FALSE);
+            if (rr == SL_RESULT_PERMISSION_DENIED) return failStart(-6);
+            if (rr != SL_RESULT_SUCCESS) return failStart(-5);
+
+            if ((*g_recObj)->GetInterface(g_recObj, SL_IID_RECORD, &g_rec) != SL_RESULT_SUCCESS) return failStart(-7);
+            if ((*g_recObj)->GetInterface(g_recObj, SL_IID_ANDROIDSIMPLEBUFFERQUEUE, &g_bq) != SL_RESULT_SUCCESS) return failStart(-7);
+            (*g_bq)->RegisterCallback(g_bq, bqCallback, nullptr);
+
+            g_recording = true;
+            g_thread = std::thread(writerLoop);
+            for (int i = 0; i < kNumBuf; i++) (*g_bq)->Enqueue(g_bq, g_buf[i], kBufBytes);
+
+            if ((*g_rec)->SetRecordState(g_rec, SL_RECORDSTATE_RECORDING) != SL_RESULT_SUCCESS) {
+              g_recording = false;
+              { std::lock_guard<std::mutex> lk(g_qmtx); g_stopWriter = true; }
+              g_cv.notify_all();
+              if (g_thread.joinable()) g_thread.join();
+              return failStart(-8);
+            }
+            LOGI("rekam mulai: %s", path);
+            return 0;
+          }
+
+          API int bodycam_stop(void) {
+            std::lock_guard<std::mutex> ctl(g_ctl);
+            if (!g_recording.load()) return -1;
+            g_recording = false;
+            destroyRecorder();
+            { std::lock_guard<std::mutex> lk(g_qmtx); g_stopWriter = true; }
+            g_cv.notify_all();
+            if (g_thread.joinable()) g_thread.join();
+            if (g_fp) {
+              fflush(g_fp);
+              writeHeader(g_fp, g_dataBytes.load());
+              fclose(g_fp);
+              g_fp = nullptr;
+            }
+            g_level = 0;
+            LOGI("rekam selesai, %u byte", g_dataBytes.load());
+            return 0;
+          }
+
+          API int bodycam_isRecording(void) { return g_recording.load() ? 1 : 0; }
+          API int bodycam_level(void) { return g_level.load(); }
+          API int bodycam_maxPeak(void) { return g_maxPeak.load(); }
+          API int bodycam_seconds(void) { return (int)(g_dataBytes.load() / (kRate * 2)); }
+          API void bodycam_setGain(float g) { if (g < 0.1f) g = 0.1f; if (g > 8.0f) g = 8.0f; g_gain = g; }
+          EOF
+          cat > jni/Android.mk <<'EOF'
+          LOCAL_PATH := $(call my-dir)
+          include $(CLEAR_VARS)
+          LOCAL_MODULE := bodycam
+          LOCAL_SRC_FILES := bodycam.cpp
+          LOCAL_LDLIBS := -lOpenSLES -llog
+          LOCAL_CPPFLAGS := -std=c++17 -O2 -fvisibility=hidden
+          include $(BUILD_SHARED_LIBRARY)
+          EOF
+          cat > jni/Application.mk <<'EOF'
+          APP_ABI := armeabi-v7a arm64-v8a
+          APP_PLATFORM := android-21
+          APP_STL := c++_static
+          EOF
+      - name: Build libbodycam.so
+        run: $ANDROID_NDK_LATEST_HOME/ndk-build NDK_PROJECT_PATH=. NDK_APPLICATION_MK=jni/Application.mk APP_BUILD_SCRIPT=jni/Android.mk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libbodycam
+          path: libs/
