@@ -1,4 +1,4 @@
-name: build-bodycam
+name: .github/workflows/build.yml
 on:
   workflow_dispatch:
   push:
